@@ -1,14 +1,22 @@
+use std::borrow::Cow;
+
 use wgpu::{
-    Backends, Color, CompositeAlphaMode, Device, Features, Instance, Limits, PowerPreference,
-    PresentMode, Queue, RenderPassColorAttachment, Surface, SurfaceConfiguration, SurfaceError,
-    TextureUsages,
+    Backends, Color, CompositeAlphaMode, Device, Features, IndexFormat, Instance, Limits,
+    PowerPreference, PresentMode, PrimitiveTopology, Queue, RenderPassColorAttachment,
+    RenderPipeline, ShaderSource, Surface, SurfaceConfiguration, SurfaceError, TextureUsages,
 };
 use winit::{
     dpi::PhysicalSize,
     event::{ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
-    window::{Window, WindowBuilder},
+    window::Window,
 };
+
+pub struct Inputs<'a> {
+    pub source: ShaderSource<'a>,
+    pub topology: PrimitiveTopology,
+    pub strip_index_format: Option<IndexFormat>,
+}
 
 pub struct State {
     surface: Surface,
@@ -18,6 +26,7 @@ pub struct State {
     device: Device,
     queue: Queue,
     window: Window,
+    render_pipeline: RenderPipeline,
 }
 
 pub async fn run() {
@@ -26,10 +35,9 @@ pub async fn run() {
     let event_loop = EventLoop::new();
 
     // window instance
-    let window = WindowBuilder::new()
-        .with_title("WGPU Window")
-        .build(&event_loop)
-        .unwrap();
+    let window = Window::new(&event_loop).unwrap();
+
+    window.set_title("My Window");
 
     let mut state = State::new(window).await;
 
@@ -118,17 +126,94 @@ impl State {
             format: surface.get_supported_formats(&adapter)[0],
             width: size.width,
             height: size.height,
-            present_mode: PresentMode::Immediate,
+            present_mode: PresentMode::Fifo,
             alpha_mode: CompositeAlphaMode::Auto,
         };
 
         surface.configure(&device, &config);
 
+        let mut primitive_type = "triangle-list";
+        let args: Vec<String> = std::env::args().collect();
+        if args.len() > 1 {
+            primitive_type = &args[1];
+        }
+
+        let mut topology = wgpu::PrimitiveTopology::PointList;
+        let mut index_format = None;
+        if primitive_type == "line-list" {
+            topology = wgpu::PrimitiveTopology::LineList;
+            index_format = None;
+        } else if primitive_type == "triangle-list" {
+            topology = wgpu::PrimitiveTopology::TriangleList;
+        } else if primitive_type == "triangle-strip" {
+            topology = wgpu::PrimitiveTopology::TriangleStrip;
+            index_format = Some(wgpu::IndexFormat::Uint32);
+        } else if primitive_type == "line-strip" {
+            topology = wgpu::PrimitiveTopology::LineStrip;
+            index_format = Some(wgpu::IndexFormat::Uint32);
+        }
+
+        window.set_title(&*format!("{}: {}", "Primitive", primitive_type));
+
+        let inputs = Inputs {
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shader_triangle.wgsl"))),
+            topology: topology,
+            strip_index_format: index_format,
+        };
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Shader"),
+            source: inputs.source,
+        });
+
+        let render_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Render Pipeline Layout"),
+                bind_group_layouts: &[],
+                push_constant_ranges: &[],
+            });
+
+        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Render Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent::REPLACE,
+                        alpha: wgpu::BlendComponent::REPLACE,
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: inputs.topology,
+                strip_index_format: inputs.strip_index_format,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            // If the pipeline will be used with a multiview render pass, this
+            // indicates how many array layers the attachments will have.
+            multiview: None,
+        });
+
         Self {
             background: wgpu::Color {
-                r: 0.1,
-                g: 0.1,
-                b: 0.9,
+                r: 0.05,
+                g: 0.062,
+                b: 0.08,
                 a: 1.0,
             },
             size,
@@ -137,6 +222,7 @@ impl State {
             device,
             queue,
             window,
+            render_pipeline,
         }
     }
 
@@ -165,7 +251,7 @@ impl State {
 
         // actual drawing started here
         {
-            let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &view,
@@ -177,6 +263,8 @@ impl State {
                 })],
                 depth_stencil_attachment: None,
             });
+            _render_pass.set_pipeline(&self.render_pipeline);
+            _render_pass.draw(0..9, 0..1);
         }
 
         // submit will accept anything that implements IntoIter
@@ -192,16 +280,16 @@ impl State {
 
     fn input(&mut self, event: &WindowEvent) -> bool {
         match event {
-            WindowEvent::CursorMoved { position, .. } => {
-                println!("Change Color");
-                self.background = Color {
-                    r: position.x as f64 / self.size.width as f64,
-                    g: position.y as f64 / self.size.height as f64,
-                    b: 1.0,
-                    a: 1.0,
-                };
-                true
-            }
+            // WindowEvent::CursorMoved { position, .. } => {
+            //     // println!("Change Color");
+            //     // self.background = Color {
+            //     //     r: position.x as f64 / self.size.width as f64,
+            //     //     g: position.y as f64 / self.size.height as f64,
+            //     //     b: 1.0,
+            //     //     a: 1.0,
+            //     // };
+            //     true
+            // }
             _ => false,
         }
     }
